@@ -1,0 +1,287 @@
+---
+title: "FinalProject"
+author: "Amit Chaulagain"
+date: "2026-04-30"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load all necessary packages
+```{r}
+rm(list=ls())
+
+# Load the packages
+library(fpp3)
+library(codetools)
+library(languageserver)
+library(markdown)
+library(dplyr)
+
+# Set up chunk for all slides
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  cache = TRUE,
+  dev.args = list(pointsize = 11)
+)
+options(
+  digits = 3,
+  width = 75,
+  ggplot2.continuous.colour = "viridis",
+  ggplot2.continuous.fill = "viridis",
+  ggplot2.discrete.colour = c("#D55E00", "#0072B2", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#F0E442"),
+  ggplot2.discrete.fill = c("#D55E00", "#0072B2", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#F0E442")
+)
+```
+
+
+```{r}
+##----------------------------------------------------------------------------##
+## Project: Monthly Airbnb Demand Forecasting - Chicago
+## Instructor: Dr. Jabir Rahman
+##----------------------------------------------------------------------------##
+
+library(fpp3)
+library(readr)
+
+# 1. LOAD DATA
+path_to_data <- "D:/OKCU Study Materials/forecasting/final project/reviews.csv"
+raw_data <- read_csv(path_to_data)
+
+# 2. DATA PREPARATION & MONTHLY AGGREGATION
+# We aggregate the 'count' from the raw data into monthly buckets
+library(lubridate)
+
+# Convert FIRST
+raw_data <- raw_data %>%
+  mutate(date = ymd(date))
+
+# Now this works
+last_date <- max(raw_data$date, na.rm = TRUE)
+
+last_complete_month <- yearmonth(
+  floor_date(last_date, "month") - days(1)
+)
+
+airbnb <- raw_data %>%
+  mutate(month = yearmonth(date)) %>%
+  count(month, name = "count") %>%
+  filter(month <= last_complete_month) %>%
+  as_tsibble(index = month) %>%
+  mutate(log_count = log1p(count))
+
+# 3. EXPLORATORY DATA ANALYSIS (Shortened to post-2022 for stability)
+airbnb_short <- airbnb %>% filter(year(month) > 2022)
+
+# Visualization of Trend and Seasonality
+airbnb_short %>% autoplot(log_count) + 
+  labs(title = "Monthly Airbnb Log-Demand (Chicago)", y = "Log(Count)")
+
+# STL Decomposition
+airbnb_short %>%
+  model(stl = STL(log_count)) %>%
+  components() %>%
+  autoplot()
+
+# 4. TRAIN/TEST SPLIT
+# Hold out the last 6 months for testing
+h_horizon <- 6
+train <- airbnb_short %>% slice(1:(n() - h_horizon))
+test  <- airbnb_short %>% slice_tail(n = h_horizon)
+
+# 5. BUILD BASELINE MODELS
+fit_base <- train %>%
+  model(
+    Mean = MEAN(log_count),
+    `Naïve` = NAIVE(log_count),
+    `Seasonal Naïve` = SNAIVE(log_count),
+    Drift = RW(log_count ~ drift()),
+    ETS = ETS(log_count),
+    ARIMA = ARIMA(log_count)
+  )
+
+# 6. FORECASTING
+fc_base <- fit_base %>% forecast(h = h_horizon)
+
+# 7. COMPARE ACCURACY
+# Compare forecasts against the actual 'test' data
+accuracy_table <- fc_base %>% 
+  accuracy(airbnb_short) %>%
+  select(.model, RMSE, MAE, MAPE, MASE) %>%
+  arrange(RMSE)
+
+print("--- Model Accuracy Comparison ---")
+print(accuracy_table)
+
+# 8. FINAL VISUALIZATION
+fc_base %>%
+  autoplot(airbnb_short, level = NULL) +
+  labs(
+    y = "Log(Count)",
+    title = "Comparison of Baseline Forecasts vs Actuals",
+    subtitle = "Chicago Monthly Airbnb Reviews"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Step A: Determine differencing (d)
+train |> features(log_count, unitroot_ndiffs)
+
+# Step B: Visualize ACF/PACF of the differenced data
+train |> 
+  gg_tsdisplay(difference(log_count), plot_type = 'partial') +
+  labs(title = "Differenced Log-Demand ACF/PACF")
+```
+
+
+```{r}
+# Step A: Determine seasonal differencing (D)
+train |> features(log_count, unitroot_nsdiffs)
+
+# Step B: Fit a manual SARIMA model 
+# Let's assume a seasonal AR(1) component based on the monthly frequency
+fit_sarima <- train |>
+  model(
+    #manual_sarima = ARIMA(log_count ~ pdq(1,1,0) + PDQ(1,0,0)),
+    auto_sarima = ARIMA(log_count)
+  )
+
+report(fit_sarima |> select(auto_sarima))
+```
+
+
+```{r}
+# Check residuals for the automated ARIMA model
+fit_sarima |> 
+  select(auto_sarima) |> 
+  gg_tsresiduals()
+
+# Ljung-Box test to confirm no remaining autocorrelation
+augment(fit_sarima) |>
+  filter(.model == "auto_sarima") |>
+  features(.innov, ljung_box, lag = 12, dof = 3)
+```
+
+
+```{r}
+# Combine models for a final showdown
+fit_final <- train |>
+  model(
+    # Aligning with your tests: d=1, D=1
+    Manual_SARIMA = ARIMA(log_count ~ pdq(1,1,0) + PDQ(0,1,1)),
+    Auto_ARIMA = ARIMA(log_count)
+  )
+
+fit_final |> select(Manual_SARIMA) |> report()
+
+# Forecast and calculate accuracy on test set
+fc_final <- fit_final |> forecast(h = h_horizon)
+
+accuracy_final <- fc_final |> 
+  accuracy(airbnb_short) |>
+  arrange(RMSE)
+
+print("--- Final Model Comparison (Baseline vs ARIMA vs SARIMA) ---")
+accuracy_final |> select(.model, RMSE, MAE, MAPE)
+```
+
+
+```{r}
+#Advanced Forecasting Models
+#A.
+#STL + ETS Model
+stl_ets_model <- train %>%
+  model(
+    STL_ETS = decomposition_model(
+      STL(log_count ~ season(window = "periodic")),
+      ETS(season_adjust ~ season("N"))
+    )
+  )
+
+# Forecast
+fc_stl_ets <- stl_ets_model %>%
+  forecast(h = h_horizon)
+
+# Plot
+fc_stl_ets %>%
+  autoplot(airbnb_short) +
+  labs(title = "STL + ETS Forecast")
+```
+```{r}
+# Neural Network Model
+fit_nn <- train %>%
+  model(
+    NNETAR(log_count)
+  )
+
+fc_nn <- fit_nn %>%
+  forecast(h = h_horizon)
+
+fc_nn %>%
+  autoplot(airbnb_short) +
+  labs(title = "Neural Network Forecast")
+```
+
+```{r}
+# Combine all models
+fit_all <- train %>%
+  model(
+    ARIMA = ARIMA(log_count),
+    ETS = ETS(log_count),
+    STL_ETS = decomposition_model(
+      STL(log_count ~ season(window = "periodic")),
+      ETS(season_adjust ~ season("N"))
+    ),
+    NN = NNETAR(log_count)
+  )
+
+fc_all <- fit_all %>%
+  forecast(h = h_horizon)
+
+# Accuracy comparison
+accuracy(fc_all, airbnb_short)
+```
+
+```{r}
+# Combine models
+fit_combined <- train %>%
+  model(
+    ARIMA = ARIMA(log_count),
+    ETS = ETS(log_count),
+    STL_ETS = decomposition_model(
+      STL(log_count ~ season(window = "periodic")),
+      ETS(season_adjust ~ season("N"))
+    )
+  ) %>%
+  mutate(Combo = (ARIMA + ETS + STL_ETS) / 3)
+
+# Forecast
+fc_combo <- fit_combined %>%
+  forecast(h = h_horizon)
+
+# Accuracy
+accuracy(fc_combo, airbnb_short)
+```
+
+```{r}
+# Re-fit to the entire airbnb_short dataset
+final_production_fit <- airbnb_short |>
+  model(Best_Model = ARIMA(log_count))
+
+# Forecast 12 months into the future
+final_production_fit |>
+  forecast(h = 12) |>
+  autoplot(airbnb_short) +
+  labs(
+    title = "12-Month Airbnb Demand Forecast (Chicago)",
+    subtitle = "Based on optimal ARIMA parameters",
+    y = "Log(Count)"
+  )
+```
